@@ -1,0 +1,21 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+fastapi
+uvicorn
+pydantic
+torch==2.9.0
+torchvision==0.24.0
+torchaudio==2.9.0
+easyocr
+supervision==0.18.0
+transformers
+ultralytics==8.3.70
+numpy==1.26.4
+opencv-python
+opencv-python-headless
+accelerate
+timm
+einops==0.8.0
+pillow
+matplotlib
+requests
