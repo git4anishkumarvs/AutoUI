@@ -1,0 +1,33 @@
+{
+  "backend": "omniparser",
+  "huggingface": {
+    "model_id": "OpenGVLab/ScaleCUA-3B",
+    "device_map": "cuda",
+    "service_url": "http://127.0.0.1:8000"
+  },
+  "openai_compatible": {
+    "api_base": "http://localhost:1234/v1",
+    "model_name": "local-model",
+    "api_key": "lm-studio",
+    "service_url": "http://127.0.0.1:8000",
+    "supports_vision": true
+  },
+  "vllm_compatible": {
+    "api_base": "http://localhost:8030/v1",
+    "model_name": "OpenGVLab/ScaleCUA-3B",
+    "api_key": "docker",
+    "service_url": "http://127.0.0.1:8000",
+    "supports_vision": true
+  },
+  "omniparser": {
+    "display_name": "OmniParser",
+    "service_url": "http://127.0.0.1:8000",
+    "device": "cuda",
+    "box_threshold": 0.05,
+    "weights_root": "vlm_service/common/omniparser/weights",
+    "ocr_backend": "easyocr",
+    "mathpix_app_id": "",
+    "mathpix_api_key": "",
+    "mathpix_endpoint": "https://api.mathpix.com/v3/text"
+  }
+}
