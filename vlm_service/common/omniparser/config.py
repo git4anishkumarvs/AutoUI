@@ -20,9 +20,10 @@ class Settings:
     caption_model_name = "florence2"
     box_threshold = 0.05
     ocr_backend = "easyocr"
-    mathpix_api_key = os.getenv("MATHPIX_API_KEY", "")
-    mathpix_app_id = os.getenv("MATHPIX_APP_ID", "")
-    mathpix_endpoint = os.getenv("MATHPIX_ENDPOINT", "https://api.mathpix.com/v3/text")
+    control_merge_pixel_threshold = 10
+    control_merge_threshold = 25
+    iou_threshold = 0.1
+    detection_resolution_scale = 1.0
     requested_device = os.getenv("OMNIPARSER_DEVICE", "cuda")
     device = (
         "cuda"
@@ -38,9 +39,10 @@ class Settings:
         settings = cls()
         settings.box_threshold = float(config.get("box_threshold", settings.box_threshold))
         settings.ocr_backend = str(config.get("ocr_backend", settings.ocr_backend)).lower().strip()
-        settings.mathpix_api_key = config.get("mathpix_api_key", settings.mathpix_api_key)
-        settings.mathpix_app_id = config.get("mathpix_app_id", settings.mathpix_app_id)
-        settings.mathpix_endpoint = config.get("mathpix_endpoint", settings.mathpix_endpoint)
+        settings.control_merge_pixel_threshold = int(config.get("control_merge_pixel_threshold", settings.control_merge_pixel_threshold))
+        settings.control_merge_threshold = int(config.get("control_merge_threshold", settings.control_merge_threshold))
+        settings.iou_threshold = float(config.get("iou_threshold", settings.iou_threshold))
+        settings.detection_resolution_scale = float(config.get("detection_resolution_scale", settings.detection_resolution_scale))
         settings.requested_device = config.get("device", settings.requested_device)
         settings.device = (
             "cuda"

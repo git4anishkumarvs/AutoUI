@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import base64
 import io
 import os
 import time
 from pathlib import Path
 
 import numpy as np
-import requests
 import torch
 from PIL import Image
 
@@ -125,12 +123,7 @@ class OmniParserService:
             texts = self._extract_texts_from_paddle_result(result)
             return texts, ocr_client
 
-        if backend == "mathpix":
-            try:
-                return self._read_crop_text_mathpix(crop), ocr_client
-            except Exception:
-                return [], ocr_client
-
+        
         if ocr_client is None:
             ocr_client = get_easyocr_reader(device=self.settings.device)
 
@@ -198,33 +191,7 @@ class OmniParserService:
         walk(result)
         return texts
 
-    def _read_crop_text_mathpix(self, crop: Image.Image) -> list[str]:
-        if not self.settings.mathpix_app_id or not self.settings.mathpix_api_key:
-            raise RuntimeError("Mathpix OCR selected but credentials are not configured.")
-
-        buffer = io.BytesIO()
-        crop.save(buffer, format="PNG")
-        image_base64 = base64.b64encode(buffer.getvalue()).decode("ascii")
-        payload = {
-            "src": f"data:image/png;base64,{image_base64}",
-            "formats": ["text"],
-        }
-        headers = {
-            "app_id": self.settings.mathpix_app_id,
-            "app_key": self.settings.mathpix_api_key,
-            "Content-type": "application/json",
-        }
-        response = requests.post(
-            self.settings.mathpix_endpoint,
-            headers=headers,
-            json=payload,
-            timeout=60,
-        )
-        response.raise_for_status()
-        data = response.json()
-        text = (data.get("text") or "").strip()
-        return [text] if text else []
-
+    
     def parse_controls(
         self,
         image_base64: str | None = None,
@@ -263,10 +230,13 @@ class OmniParserService:
             caption_model_processor=None,
             ocr_text=ocr_text,
             use_local_semantics=False,
-            iou_threshold=0.7,
-            scale_img=False,
+            iou_threshold=getattr(self.settings, 'iou_threshold', 0.1),
+            scale_img=True,
             batch_size=128,
             device=self.settings.device,
+            pixel_threshold=getattr(self.settings, 'control_merge_pixel_threshold', 10),
+            merge_threshold=getattr(self.settings, 'control_merge_threshold', 25),
+            resolution_scale=getattr(self.settings, 'detection_resolution_scale', 1.0),
         )
         parsed_content_list = self._enrich_control_content(image, parsed_content_list)
         controls = [self._build_control(index, raw_control) for index, raw_control in enumerate(parsed_content_list)]

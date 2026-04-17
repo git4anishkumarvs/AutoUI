@@ -334,14 +334,22 @@ def remove_overlap(boxes, iou_threshold, ocr_bbox=None):
     return torch.tensor(filtered_boxes)
 
 
-def remove_overlap_new(boxes, iou_threshold, ocr_bbox=None):
+def remove_overlap_new(boxes, iou_threshold, ocr_bbox=None, debug=False, image_width=None, image_height=None, pixel_threshold=10, merge_threshold=25):
     '''
+    Simplified overlap removal that preserves radio button and checkbox labels.
+    If gap between control and label is < pixel_threshold, treats as single control.
+    When pixel_threshold is 0, disables grouping logic and uses old behavior.
+    If overlap >= merge_threshold, merges overlapping controls into single control.
+    If containment >= merge_threshold, merges controls (unified threshold for both).
+    
     ocr_bbox format: [{'type': 'text', 'bbox':[x,y], 'interactivity':False, 'content':str }, ...]
     boxes format: [{'type': 'icon', 'bbox':[x,y], 'interactivity':True, 'content':None }, ...]
-
+    pixel_threshold: int - Maximum gap in pixels to merge control and label (default: 10, 0 = disable grouping)
+    merge_threshold: int - Unified threshold for overlap and containment merging (default: 25, 0 = disable all merging)
     '''
-    assert ocr_bbox is None or isinstance(ocr_bbox, List)
-
+    if ocr_bbox is None:
+        return boxes
+    
     def box_area(box):
         return (box[2] - box[0]) * (box[3] - box[1])
 
@@ -355,64 +363,364 @@ def remove_overlap_new(boxes, iou_threshold, ocr_bbox=None):
     def IoU(box1, box2):
         intersection = intersection_area(box1, box2)
         union = box_area(box1) + box_area(box2) - intersection + 1e-6
-        if box_area(box1) > 0 and box_area(box2) > 0:
-            ratio1 = intersection / box_area(box1)
-            ratio2 = intersection / box_area(box2)
+        return intersection / union if union > 0 else 0
+
+    def is_control_pair(icon_box, text_box, image_width=None, image_height=None, pixel_threshold=10):
+        """Check if this looks like a radio button or checkbox and its label"""
+        # Radio buttons and checkboxes typically have:
+        # 1. Small icon box (the button/checkbox)
+        # 2. Text box to the right of the icon
+        # 3. Similar vertical positioning
+        
+        icon_area = box_area(icon_box)
+        text_area = box_area(text_box)
+        
+        # Icon should be much smaller than text
+        if icon_area > text_area * 0.5:
+            return False, "large_icon"
+        
+        # Text should be to the right of icon (typical layout)
+        if text_box[0] < icon_box[2]:  # Text starts before icon ends
+            return False, "text_left"
+        
+        # Should have some vertical overlap
+        vertical_overlap = min(icon_box[3], text_box[3]) - max(icon_box[1], text_box[1])
+        if vertical_overlap <= 0:
+            return False, "no_vertical_overlap"
+        
+        # Calculate horizontal distance in pixels if image dimensions available
+        horizontal_distance = text_box[0] - icon_box[2]
+        
+        if image_width and image_height:
+            # Convert normalized coordinates to pixels
+            pixel_distance = horizontal_distance * image_width
+            
+            # If gap is less than threshold pixels, treat as single control
+            if pixel_distance <= pixel_threshold:
+                return True, "single_control"
+        
+        # For larger gaps, still consider as pair but keep separate
+        max_distance = (icon_box[2] - icon_box[0]) * 3  # 3x the icon width
+        if horizontal_distance <= max_distance:
+            return True, "separate_controls"
+        
+        return False, "too_far"
+
+    def merge_control_controls(icon_elem, text_elem):
+        """Merge icon and text into a single radio button or checkbox control"""
+        icon_bbox = icon_elem['bbox']
+        text_bbox = text_elem['bbox']
+        
+        # Create a combined bounding box that encompasses both
+        merged_bbox = [
+            min(icon_bbox[0], text_bbox[0]),  # left
+            min(icon_bbox[1], text_bbox[1]),  # top
+            max(icon_bbox[2], text_bbox[2]),  # right
+            max(icon_bbox[3], text_bbox[3])   # bottom
+        ]
+        
+        # Determine control type based on icon aspect ratio (checkbox is more square)
+        icon_width = icon_bbox[2] - icon_bbox[0]
+        icon_height = icon_bbox[3] - icon_bbox[1]
+        aspect_ratio = icon_width / icon_height if icon_height > 0 else 1.0
+        
+        # Checkbox: aspect ratio close to 1.0 (square)
+        # Radio button: aspect ratio close to 1.0 but typically circular
+        # Use a more flexible range for checkbox detection
+        if 0.6 <= aspect_ratio <= 1.6:
+            control_type = "checkbox"
         else:
-            ratio1, ratio2 = 0, 0
-        return max(intersection / union, ratio1, ratio2)
+            control_type = "radio_button"
+        
+        if debug:
+            print(f"    -> Aspect ratio: {aspect_ratio:.2f}, classified as: {control_type}")
+        
+        # Create merged control
+        merged_control = {
+            'type': control_type,
+            'bbox': merged_bbox,
+            'interactivity': True,
+            'content': text_elem.get('content', ''),
+            'source': f'merged_{control_type}',
+            'icon_bbox': icon_bbox,  # Keep original icon bbox for reference
+            'text_bbox': text_bbox   # Keep original text bbox for reference
+        }
+        
+        return merged_control
 
-    def is_inside(box1, box2):
-        # return box1[0] >= box2[0] and box1[1] >= box2[1] and box1[2] <= box2[2] and box1[3] <= box2[3]
-        intersection = intersection_area(box1, box2)
-        ratio1 = intersection / box_area(box1)
-        return ratio1 > 0.80
+    def is_fully_contained(small_box, large_box):
+        """Check if small_box is fully inside large_box"""
+        return (small_box[0] >= large_box[0] and small_box[1] >= large_box[1] and
+                small_box[2] <= large_box[2] and small_box[3] <= large_box[3])
+    
+    def calculate_partial_containment(box1, box2):
+        """Calculate what percentage of box1 is inside box2"""
+        # Calculate the intersection area
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+        
+        # If no intersection, return 0
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+        
+        # Calculate intersection area and box1 area
+        intersection_area = (x2 - x1) * (y2 - y1)
+        box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        
+        # Return percentage of box1 that's inside box2
+        return (intersection_area / box1_area * 100) if box1_area > 0 else 0.0
 
-    # boxes = boxes.tolist()
-    filtered_boxes = []
-    if ocr_bbox:
+    # If pixel_threshold is 0, disable grouping logic and use old behavior
+    if pixel_threshold == 0:
+        if debug:
+            print("Pixel threshold is 0 - using old behavior without grouping")
+        
+        # Simple old behavior: just add OCR boxes and process icons without grouping
+        filtered_boxes = []
         filtered_boxes.extend(ocr_bbox)
-    # print('ocr_bbox!!!', ocr_bbox)
-    for i, box1_elem in enumerate(boxes):
-        box1 = box1_elem['bbox']
-        is_valid_box = True
-        for j, box2_elem in enumerate(boxes):
-            # keep the smaller box
-            box2 = box2_elem['bbox']
-            if i != j and IoU(box1, box2) > iou_threshold and box_area(box1) > box_area(box2):
-                is_valid_box = False
-                break
-        if is_valid_box:
-            if ocr_bbox:
-                # keep yolo boxes + prioritize ocr label
-                box_added = False
-                ocr_labels = ''
-                for box3_elem in ocr_bbox:
-                    if not box_added:
-                        box3 = box3_elem['bbox']
-                        if is_inside(box3, box1): # ocr inside icon
-                            # box_added = True
-                            # delete the box3_elem from ocr_bbox
-                            try:
-                                # gather all ocr labels
-                                ocr_labels += box3_elem['content'] + ' '
-                                filtered_boxes.remove(box3_elem)
-                            except:
-                                continue
-                            # break
-                        elif is_inside(box1, box3): # icon inside ocr, don't added this icon box, no need to check other ocr bbox bc no overlap between ocr bbox, icon can only be in one ocr box
-                            box_added = True
-                            break
-                        else:
-                            continue
-                if not box_added:
-                    if ocr_labels:
-                        filtered_boxes.append({'type': 'icon', 'bbox': box1_elem['bbox'], 'interactivity': True, 'content': ocr_labels, 'source':'box_yolo_content_ocr'})
-                    else:
-                        filtered_boxes.append({'type': 'icon', 'bbox': box1_elem['bbox'], 'interactivity': True, 'content': None, 'source':'box_yolo_content_yolo'})
+        
+        for icon_elem in boxes:
+            icon_bbox = icon_elem['bbox']
+            
+            if debug:
+                print(f"Processing icon (old behavior): {icon_bbox}")
+            
+            # Check for fully contained text (old logic)
+            for text_elem in ocr_bbox:
+                text_bbox = text_elem['bbox']
+                
+                if is_fully_contained(text_bbox, icon_bbox):
+                    # Text is fully inside icon - merge it
+                    if debug:
+                        print(f"  -> Text fully inside icon, merging content")
+                    icon_with_content = icon_elem.copy()
+                    icon_with_content['content'] = text_elem.get('content', '')
+                    icon_with_content['source'] = 'box_yolo_content_ocr'
+                    filtered_boxes.append(icon_with_content)
+                    break
             else:
-                filtered_boxes.append(box1)
-    return filtered_boxes # torch.tensor(filtered_boxes)
+                # No fully contained text, add icon as-is
+                filtered_boxes.append(icon_elem)
+                if debug:
+                    print(f"  -> Added icon without content")
+        
+        return filtered_boxes
+
+    filtered_boxes = []
+    merged_text_boxes = []  # Track text boxes that have been merged
+    
+    # Process each icon box first to determine what gets merged
+    icon_processing_results = []
+    
+    for icon_elem in boxes:
+        icon_bbox = icon_elem['bbox']
+        
+        if debug:
+            print(f"Processing icon: {icon_bbox}")
+        
+        # Check if this icon overlaps with any OCR text
+        overlapping_texts = []
+        fully_contained_texts = []
+        close_control_pairs = []  # Text within 10 pixels - will be merged
+        
+        for text_elem in ocr_bbox:
+            text_bbox = text_elem['bbox']
+            
+            if debug:
+                print(f"  Checking text: {text_bbox} ('{text_elem.get('content', 'N/A')}')")
+            
+            # Check for overlap
+            overlap_iou = IoU(icon_bbox, text_bbox)
+            
+            if is_fully_contained(text_bbox, icon_bbox):
+                # Text is fully inside icon - merge it
+                fully_contained_texts.append(text_elem)
+                if debug:
+                    print(f"    -> Text fully inside icon, will merge")
+            else:
+                # Check if this is a control pair with pixel-based detection
+                is_pair, pair_type = is_control_pair(icon_bbox, text_bbox, image_width, image_height, pixel_threshold=pixel_threshold)
+                
+                if is_pair:
+                    if pair_type == "single_control":
+                        # Gap < 10 pixels - merge into single control
+                        close_control_pairs.append(text_elem)
+                        if debug:
+                            print(f"    -> Close control pair (<{pixel_threshold}px), will merge")
+                    elif pair_type == "separate_controls":
+                        # Larger gap - keep as separate controls
+                        overlapping_texts.append(text_elem)
+                        if debug:
+                            print(f"    -> Control pair with gap, keeping separate")
+                elif overlap_iou > 0.01:
+                    # General overlap - keep both
+                    overlapping_texts.append(text_elem)
+                    if debug:
+                        print(f"    -> General overlap, keeping separate")
+        
+        # Store processing results for this icon
+        icon_processing_results.append({
+            'icon_elem': icon_elem,
+            'close_control_pairs': close_control_pairs,
+            'fully_contained_texts': fully_contained_texts,
+            'overlapping_texts': overlapping_texts
+        })
+        
+        # Track which text boxes are being merged
+        for text_elem in close_control_pairs + fully_contained_texts:
+            merged_text_boxes.append(text_elem)
+    
+    # Now build the final filtered_boxes list
+    # Add only OCR text boxes that were NOT merged
+    for text_elem in ocr_bbox:
+        if text_elem not in merged_text_boxes:
+            filtered_boxes.append(text_elem)
+            if debug:
+                print(f"  -> Kept separate text: '{text_elem.get('content', 'N/A')}'")
+    
+    # Process icons and add merged/separate controls
+    for result in icon_processing_results:
+        icon_elem = result['icon_elem']
+        close_control_pairs = result['close_control_pairs']
+        fully_contained_texts = result['fully_contained_texts']
+        overlapping_texts = result['overlapping_texts']
+        
+        # Handle close control pairs (gap < pixel_threshold pixels) - merge into single control
+        if close_control_pairs:
+            for text_elem in close_control_pairs:
+                merged_control = merge_control_controls(icon_elem, text_elem)
+                filtered_boxes.append(merged_control)
+                if debug:
+                    control_type = merged_control.get('type', 'control')
+                    print(f"  -> Added merged {control_type}: '{text_elem.get('content', '')}'")
+        
+        # Handle fully contained text
+        elif fully_contained_texts:
+            # Merge contained text into icon
+            merged_content = ' '.join([t['content'] for t in fully_contained_texts if t.get('content')])
+            icon_with_content = icon_elem.copy()
+            icon_with_content['content'] = merged_content
+            icon_with_content['source'] = 'box_yolo_content_ocr'
+            filtered_boxes.append(icon_with_content)
+            if debug:
+                print(f"  -> Added icon with merged content: '{merged_content}'")
+        
+        # Add icon as-is if no merging occurred
+        else:
+            filtered_boxes.append(icon_elem)
+            if debug:
+                print(f"  -> Added icon without content")
+    
+    # Handle overlap-based merging if enabled
+    if merge_threshold > 0:
+        if debug:
+            print(f"\n=== UNIFIED MERGING (threshold: {merge_threshold}%) ===")
+        
+        merged_overlaps = set()  # Track which controls have been merged
+        final_filtered_boxes = []
+        
+        for i, control1 in enumerate(filtered_boxes):
+            if i in merged_overlaps:
+                continue  # Skip already merged controls
+                
+            bbox1 = control1['bbox']
+            merged_with_control1 = [control1]  # Start with this control
+            
+            # Check for overlaps with other controls
+            for j, control2 in enumerate(filtered_boxes):
+                if j <= i or j in merged_overlaps:
+                    continue  # Skip self and already merged controls
+                
+                bbox2 = control2['bbox']
+                
+                # Calculate overlap percentage
+                overlap_iou = IoU(bbox1, bbox2)
+                overlap_percentage = overlap_iou * 100
+                
+                # Check if control2 is completely inside control1
+                control2_inside_control1 = is_fully_contained(bbox2, bbox1)
+                control1_inside_control2 = is_fully_contained(bbox1, bbox2)
+                
+                # Calculate partial containment
+                control2_partial_in_control1 = calculate_partial_containment(bbox2, bbox1)
+                control1_partial_in_control2 = calculate_partial_containment(bbox1, bbox2)
+                
+                if debug:
+                    content1 = control1.get('content', 'N/A')[:20]
+                    content2 = control2.get('content', 'N/A')[:20]
+                    print(f"  Checking overlap: {content1} <-> {content2}")
+                    print(f"    Overlap: {overlap_percentage:.1f}%")
+                    print(f"    Inside check: {control2_inside_control1} or {control1_inside_control2}")
+                    print(f"    Partial containment: {control2_partial_in_control1:.1f}% or {control1_partial_in_control2:.1f}%")
+                
+                # Merge if any condition meets the unified threshold
+                should_merge = (overlap_percentage >= merge_threshold or 
+                              control2_inside_control1 or 
+                              control1_inside_control2 or
+                              control2_partial_in_control1 >= merge_threshold or
+                              control1_partial_in_control2 >= merge_threshold)
+                
+                if should_merge:
+                    if debug:
+                        if control2_inside_control1:
+                            reason = "control2 inside control1"
+                        elif control1_inside_control2:
+                            reason = "control1 inside control2"
+                        elif control2_partial_in_control1 >= merge_threshold:
+                            reason = f"control2 {control2_partial_in_control1:.1f}% inside control1 >= {merge_threshold}%"
+                        elif control1_partial_in_control2 >= merge_threshold:
+                            reason = f"control1 {control1_partial_in_control2:.1f}% inside control2 >= {merge_threshold}%"
+                        else:
+                            reason = f"overlap {overlap_percentage:.1f}% >= {merge_threshold}%"
+                        print(f"    -> MERGE: {reason}")
+                    
+                    merged_with_control1.append(control2)
+                    merged_overlaps.add(j)
+            
+            # Create merged control if we have more than one control
+            if len(merged_with_control1) > 1:
+                # Create combined bounding box
+                all_bboxes = [c['bbox'] for c in merged_with_control1]
+                merged_bbox = [
+                    min(bbox[0] for bbox in all_bboxes),  # left
+                    min(bbox[1] for bbox in all_bboxes),  # top
+                    max(bbox[2] for bbox in all_bboxes),  # right
+                    max(bbox[3] for bbox in all_bboxes)   # bottom
+                ]
+                
+                # Combine content from all merged controls
+                merged_content = ' + '.join([c.get('content', '') for c in merged_with_control1 if c.get('content')])
+                merged_content = merged_content.strip()
+                
+                # Determine control type (prioritize checkbox > radio_button > others)
+                control_types = [c.get('type', 'icon') for c in merged_with_control1]
+                if 'checkbox' in control_types:
+                    final_type = 'checkbox'
+                elif 'radio_button' in control_types:
+                    final_type = 'radio_button'
+                else:
+                    final_type = 'merged_control'
+                
+                merged_control = {
+                    'type': final_type,
+                    'bbox': merged_bbox,
+                    'interactivity': True,
+                    'content': merged_content,
+                    'source': f'overlap_merged_{final_type}',
+                    'merged_from': [c.get('content', 'N/A') for c in merged_with_control1]
+                }
+                
+                final_filtered_boxes.append(merged_control)
+                if debug:
+                    print(f"  -> Created merged {final_type}: '{merged_content}'")
+            else:
+                final_filtered_boxes.append(control1)
+        
+        filtered_boxes = final_filtered_boxes
+    
+    return filtered_boxes
 
 
 def load_image(image_path: str) -> Tuple[np.array, torch.Tensor]:
@@ -506,7 +814,7 @@ def int_box_area(box, w, h):
     area = (int_box[2] - int_box[0]) * (int_box[3] - int_box[1])
     return area
 
-def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_TRESHOLD=0.01, output_coord_in_ratio=False, ocr_bbox=None, text_scale=0.4, text_padding=5, draw_bbox_config=None, caption_model_processor=None, ocr_text=[], use_local_semantics=True, iou_threshold=0.9,prompt=None, scale_img=False, imgsz=None, batch_size=128, device="cuda"):
+def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_TRESHOLD=0.01, output_coord_in_ratio=False, ocr_bbox=None, text_scale=0.4, text_padding=5, draw_bbox_config=None, caption_model_processor=None, ocr_text=[], use_local_semantics=True, iou_threshold=0.9,prompt=None, scale_img=False, imgsz=None, batch_size=128, device="cuda", pixel_threshold=10, merge_threshold=25, resolution_scale=1.0):
     """Process either an image path or Image object
     
     Args:
@@ -517,10 +825,21 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
         image_source = Image.open(image_source)
     image_source = image_source.convert("RGB") # for CLIP
     w, h = image_source.size
+    
+    # Calculate scaled resolution based on scale factor
     if not imgsz:
-        imgsz = (h, w)
+        if resolution_scale != 1.0:
+            scaled_h = int(h * resolution_scale)
+            scaled_w = int(w * resolution_scale)
+            # Ensure minimum size for YOLO
+            scaled_h = max(scaled_h, 320)
+            scaled_w = max(scaled_w, 320)
+            imgsz = (scaled_h, scaled_w)
+            print(f"Resolution scaled from {w}x{h} to {scaled_w}x{scaled_h} (scale: {resolution_scale})")
+        else:
+            imgsz = (h, w)
     # print('image size:', w, h)
-    xyxy, logits, phrases = predict_yolo(model=model, image=image_source, box_threshold=BOX_TRESHOLD, imgsz=imgsz, scale_img=scale_img, iou_threshold=0.1, device=device)
+    xyxy, logits, phrases = predict_yolo(model=model, image=image_source, box_threshold=BOX_TRESHOLD, imgsz=imgsz, scale_img=scale_img, iou_threshold=iou_threshold, device=device)
     xyxy = xyxy / torch.Tensor([w, h, w, h]).to(xyxy.device)
     image_source = np.asarray(image_source)
     phrases = [str(i) for i in range(len(phrases))]
@@ -535,7 +854,7 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
 
     ocr_bbox_elem = [{'type': 'text', 'bbox':box, 'interactivity':False, 'content':txt, 'source': 'box_ocr_content_ocr'} for box, txt in zip(ocr_bbox, ocr_text) if int_box_area(box, w, h) > 0] 
     xyxy_elem = [{'type': 'icon', 'bbox':box, 'interactivity':True, 'content':None} for box in xyxy.tolist() if int_box_area(box, w, h) > 0]
-    filtered_boxes = remove_overlap_new(boxes=xyxy_elem, iou_threshold=iou_threshold, ocr_bbox=ocr_bbox_elem)
+    filtered_boxes = remove_overlap_new(boxes=xyxy_elem, iou_threshold=iou_threshold, ocr_bbox=ocr_bbox_elem, debug=False, image_width=w, image_height=h, pixel_threshold=pixel_threshold, merge_threshold=merge_threshold)
     
     # sort the filtered_boxes so that the one with 'content': None is at the end, and get the index of the first 'content': None
     filtered_boxes_elem = sorted(filtered_boxes, key=lambda x: x['content'] is None)

@@ -26,8 +26,9 @@
     "box_threshold": 0.05,
     "weights_root": "vlm_service/common/omniparser/weights",
     "ocr_backend": "easyocr",
-    "mathpix_app_id": "",
-    "mathpix_api_key": "",
-    "mathpix_endpoint": "https://api.mathpix.com/v3/text"
+    "control_merge_pixel_threshold": 5,
+    "control_merge_threshold": 80,
+    "iou_threshold": 0.1,
+    "detection_resolution_scale": 0.80
   }
 }

@@ -105,6 +105,15 @@ class OmniParserVisionWrapper(BaseVisionWrapper):
             score += 8
         if control.content:
             score += 5
+            
+        # Bonus for radio button and checkbox controls
+        if control.type in ["radio_button", "checkbox"]:
+            score += 20  # Merged controls (highest priority)
+        if control.type == "icon" and control.content and "ocr" in str(control.source):
+            score += 10  # Icon with OCR text (likely radio button or checkbox)
+        if control.type == "text" and control.interactivity:
+            score += 7  # Interactive text (could be radio/checkbox label)
+            
         return score
 
     @classmethod
