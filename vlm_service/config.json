@@ -23,7 +23,7 @@
     "display_name": "OmniParser",
     "service_url": "http://127.0.0.1:8000",
     "device": "cuda",
-    "box_threshold": 0.05,
+    "box_threshold": 0.06,
     "weights_root": "vlm_service/common/omniparser/weights",
     "ocr_backend": "easyocr",
     "control_merge_pixel_threshold": 5,
